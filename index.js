@@ -3,6 +3,7 @@ import express from "express";
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { getAuthUrl, getOAuthClient } from "./ga4_oauth.js";
+import { google } from "googleapis";
 
 const app = express();
 app.set("trust proxy", true);
@@ -48,7 +49,61 @@ function getSupabase() {
   );
   return _supabase;
 }
+async function getGa4AuthForWorkspace(workspace_id) {
+  const supabase = getSupabase();
 
+  const { data, error } = await supabase
+    .from("oauth_tokens")
+    .select("*")
+    .eq("client_id", workspace_id)
+    .eq("connector_type", "ga4")
+    .single();
+
+  if (error) throw error;
+  if (!data?.refresh_token) throw new Error("No GA4 refresh_token stored");
+
+  const oauth2Client = getOAuthClient();
+  oauth2Client.setCredentials({
+    refresh_token: data.refresh_token,
+    access_token: data.access_token || undefined,
+    expiry_date: data.expiry_date || undefined,
+  });
+
+  // Force refresh if needed
+  await oauth2Client.getAccessToken();
+
+  // Persist refreshed access token (optional but good)
+  const c = oauth2Client.credentials;
+  if (c.access_token && c.expiry_date) {
+    await supabase
+      .from("oauth_tokens")
+      .update({ access_token: c.access_token, expiry_date: c.expiry_date })
+      .eq("client_id", workspace_id)
+      .eq("connector_type", "ga4");
+  }
+
+  return oauth2Client;
+}
+
+app.get("/ga4/accounts", async (req, res) => {
+  try {
+    const workspace_id = req.query.workspace_id;
+    if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
+
+    const auth = await getGa4AuthForWorkspace(workspace_id);
+
+    const admin = google.analyticsadmin({
+      version: "v1beta",
+      auth,
+    });
+
+    const resp = await admin.accountSummaries.list();
+    return res.json(resp.data);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to list accounts", details: String(e?.message || e) });
+  }
+});
 /**
  * Signed state to prevent tampering
  * state = "<payloadBase64url>.<hmacSigBase64url>"
