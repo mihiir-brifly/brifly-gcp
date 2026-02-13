@@ -435,7 +435,266 @@ app.get("/ga4/status", async (req, res) => {
     return res.status(500).json({ error: "Failed to fetch status", details: String(e?.message || e) });
   }
 });
+// ----------------------
+// Step 5 helpers
+// ----------------------
 
+async function getBoundGa4Property(workspace_id) {
+  const supabase = getSupabase();
+
+  const { data, error } = await supabase
+    .from("workspace_connectors")
+    .select("*")
+    .eq("workspace_id", workspace_id)
+    .eq("connector_type", "ga4")
+    .maybeSingle();
+
+  if (error) throw error;
+  if (!data?.external_id) throw new Error("GA4 not bound. Call POST /ga4/bind first.");
+
+  // external_id is like "properties/523107704"
+  return data;
+}
+
+function buildGa4Request(preset, date_from, date_to, limit = 50, offset = 0) {
+  const base = {
+    dateRanges: [{ startDate: date_from, endDate: date_to }],
+    limit,
+    offset,
+  };
+
+  switch (preset) {
+    case "overview":
+      return {
+        ...base,
+        metrics: [
+          { name: "activeUsers" },
+          { name: "newUsers" },
+          { name: "sessions" },
+          { name: "screenPageViews" },
+          { name: "engagedSessions" },
+          { name: "engagementRate" },
+        ],
+      };
+
+    case "top_pages":
+      return {
+        ...base,
+        dimensions: [{ name: "pagePathPlusQueryString" }],
+        metrics: [{ name: "screenPageViews" }, { name: "activeUsers" }, { name: "sessions" }],
+        orderBys: [{ metric: { metricName: "screenPageViews" }, desc: true }],
+      };
+
+    case "acquisition":
+      return {
+        ...base,
+        dimensions: [{ name: "sessionSource" }, { name: "sessionMedium" }],
+        metrics: [{ name: "sessions" }, { name: "activeUsers" }],
+        orderBys: [{ metric: { metricName: "sessions" }, desc: true }],
+      };
+
+    case "geo":
+      return {
+        ...base,
+        dimensions: [{ name: "country" }],
+        metrics: [{ name: "activeUsers" }, { name: "sessions" }],
+        orderBys: [{ metric: { metricName: "activeUsers" }, desc: true }],
+      };
+
+    case "devices":
+      return {
+        ...base,
+        dimensions: [{ name: "deviceCategory" }],
+        metrics: [{ name: "activeUsers" }, { name: "sessions" }],
+        orderBys: [{ metric: { metricName: "activeUsers" }, desc: true }],
+      };
+
+    default:
+      throw new Error(`Unknown preset: ${preset}`);
+  }
+}
+
+function normalizeReport(report) {
+  const dimNames = (report.dimensionHeaders || []).map((d) => d.name);
+  const metNames = (report.metricHeaders || []).map((m) => m.name);
+
+  const totals =
+    report.totals?.[0]?.metricValues?.reduce((acc, mv, i) => {
+      acc[metNames[i]] = Number(mv.value);
+      return acc;
+    }, {}) || {};
+
+  const rows = (report.rows || []).map((r) => {
+    const obj = {};
+    (r.dimensionValues || []).forEach((dv, i) => (obj[dimNames[i]] = dv.value));
+    (r.metricValues || []).forEach((mv, i) => (obj[metNames[i]] = Number(mv.value)));
+    return obj;
+  });
+
+  return { totals, rows };
+}
+
+// ----------------------
+// Step 5 routes
+// ----------------------
+
+/**
+ * Optional: GA4 metadata (all valid dimensions/metrics)
+ * GET /ga4/metadata?workspace_id=<uuid>
+ */
+app.get("/ga4/metadata", async (req, res) => {
+  try {
+    const workspace_id = Array.isArray(req.query.workspace_id)
+      ? req.query.workspace_id[0]
+      : req.query.workspace_id;
+
+    if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
+
+    const binding = await getBoundGa4Property(workspace_id);
+    const auth = await getGa4AuthForWorkspace(workspace_id);
+
+    const dataApi = google.analyticsdata({ version: "v1beta", auth });
+
+    const metaResp = await dataApi.properties.getMetadata({
+      name: `${binding.external_id}/metadata`, // "properties/523107704/metadata"
+    });
+
+    return res.json(metaResp.data);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to fetch metadata", details: String(e?.message || e) });
+  }
+});
+
+/**
+ * Step 5: Run GA4 report (real data) using the *bound* property
+ * GET /ga4/report?workspace_id=<uuid>&preset=overview&date_from=30daysAgo&date_to=today&limit=50&offset=0
+ */
+app.get("/ga4/report", async (req, res) => {
+  try {
+    const workspace_id = Array.isArray(req.query.workspace_id)
+      ? req.query.workspace_id[0]
+      : req.query.workspace_id;
+
+    const preset = (Array.isArray(req.query.preset) ? req.query.preset[0] : req.query.preset) || "overview";
+    const date_from = (Array.isArray(req.query.date_from) ? req.query.date_from[0] : req.query.date_from) || "30daysAgo";
+    const date_to = (Array.isArray(req.query.date_to) ? req.query.date_to[0] : req.query.date_to) || "today";
+
+    const limitRaw = (Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit) || "50";
+    const offsetRaw = (Array.isArray(req.query.offset) ? req.query.offset[0] : req.query.offset) || "0";
+    const limit = Math.max(1, Math.min(500, Number(limitRaw)));
+    const offset = Math.max(0, Number(offsetRaw));
+
+    if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
+
+    const binding = await getBoundGa4Property(workspace_id);
+    const auth = await getGa4AuthForWorkspace(workspace_id);
+
+    const dataApi = google.analyticsdata({ version: "v1beta", auth });
+
+    const requestBody = buildGa4Request(preset, date_from, date_to, limit, offset);
+
+    const resp = await dataApi.properties.runReport({
+      property: binding.external_id, // "properties/523107704"
+      requestBody,
+    });
+
+    const normalized = normalizeReport(resp.data);
+
+    const envelope = {
+      schema_version: "1.0",
+      connector_type: "ga4",
+      workspace_id,
+      pulled_at: new Date().toISOString(),
+      request: {
+        preset,
+        date_from,
+        date_to,
+        property_id: binding.external_id,
+        limit,
+        offset,
+      },
+      data: normalized,
+      quality: {
+        row_count: normalized.rows.length,
+        warnings: [],
+      },
+      raw: resp.data, // keep raw for future-proofing
+    };
+
+    return res.json(envelope);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to run GA4 report", details: String(e?.message || e) });
+  }
+});
+
+/**
+ * Optional: Pull + store into raw_connector_data (future-proof storage)
+ * POST /ga4/store
+ * body: { workspace_id, preset, date_from, date_to, limit, offset, job_id? }
+ */
+app.post("/ga4/store", async (req, res) => {
+  try {
+    const { workspace_id, preset = "overview", date_from = "30daysAgo", date_to = "today", limit = 50, offset = 0, job_id = null } = req.body || {};
+    if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
+
+    // Reuse report logic via internal call:
+    const binding = await getBoundGa4Property(workspace_id);
+    const auth = await getGa4AuthForWorkspace(workspace_id);
+    const dataApi = google.analyticsdata({ version: "v1beta", auth });
+
+    const requestBody = buildGa4Request(preset, date_from, date_to, limit, offset);
+
+    const resp = await dataApi.properties.runReport({
+      property: binding.external_id,
+      requestBody,
+    });
+
+    const normalized = normalizeReport(resp.data);
+
+    const envelope = {
+      schema_version: "1.0",
+      connector_type: "ga4",
+      workspace_id,
+      pulled_at: new Date().toISOString(),
+      request: {
+        preset,
+        date_from,
+        date_to,
+        property_id: binding.external_id,
+        limit,
+        offset,
+      },
+      data: normalized,
+      quality: {
+        row_count: normalized.rows.length,
+        warnings: [],
+      },
+      raw: resp.data,
+    };
+
+    const supabase = getSupabase();
+
+    // Adjust keys if your raw_connector_data schema differs
+    const { data, error } = await supabase
+      .from("raw_connector_data")
+      .insert({
+        job_id: job_id,
+        connector_type: "ga4",
+        payload_json: envelope,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    return res.json({ ok: true, stored: data });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to store GA4 data", details: String(e?.message || e) });
+  }
+});
 /**
  * Make Cloud Run happy:
  * - MUST listen on process.env.PORT
