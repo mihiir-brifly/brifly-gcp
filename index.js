@@ -2,12 +2,18 @@ import "dotenv/config";
 import express from "express";
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
-import { getAuthUrl, getOAuthClient } from "./ga4_oauth.js";
 import { google } from "googleapis";
+import { getAuthUrl, getOAuthClient } from "./ga4_oauth.js";
 
 const app = express();
 app.set("trust proxy", true);
 app.use(express.json());
+
+// Avoid browser caching during testing
+app.use((req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
 
 /**
  * Never log secret values. Only log whether they exist.
@@ -17,8 +23,7 @@ function envExists(name) {
 }
 
 function requireEnv(names) {
-  const missing = names.filter((n) => !envExists(n));
-  return missing;
+  return names.filter((n) => !envExists(n));
 }
 
 /**
@@ -49,70 +54,14 @@ function getSupabase() {
   );
   return _supabase;
 }
-async function getGa4AuthForWorkspace(workspace_id) {
-  const supabase = getSupabase();
 
-  const { data, error } = await supabase
-    .from("oauth_tokens")
-    .select("*")
-    .eq("client_id", workspace_id)
-    .eq("connector_type", "ga4")
-    .single();
-
-  if (error) throw error;
-  if (!data?.refresh_token) throw new Error("No GA4 refresh_token stored");
-
-  const oauth2Client = getOAuthClient();
-  oauth2Client.setCredentials({
-    refresh_token: data.refresh_token,
-    access_token: data.access_token || undefined,
-    expiry_date: data.expiry_date || undefined,
-  });
-
-  // Force refresh if needed
-  await oauth2Client.getAccessToken();
-
-  // Persist refreshed access token (optional but good)
-  const c = oauth2Client.credentials;
-  if (c.access_token && c.expiry_date) {
-    await supabase
-      .from("oauth_tokens")
-      .update({ access_token: c.access_token, expiry_date: c.expiry_date })
-      .eq("client_id", workspace_id)
-      .eq("connector_type", "ga4");
-  }
-
-  return oauth2Client;
-}
-
-app.get("/ga4/accounts", async (req, res) => {
-  try {
-    const workspace_id = req.query.workspace_id;
-    if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
-
-    const auth = await getGa4AuthForWorkspace(workspace_id);
-
-    const admin = google.analyticsadmin({
-      version: "v1beta",
-      auth,
-    });
-
-    const resp = await admin.accountSummaries.list();
-    return res.json(resp.data);
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "Failed to list accounts", details: String(e?.message || e) });
-  }
-});
 /**
  * Signed state to prevent tampering
  * state = "<payloadBase64url>.<hmacSigBase64url>"
  */
 function signState(obj) {
   const missing = requireEnv(["STATE_SIGNING_SECRET"]);
-  if (missing.length) {
-    throw new Error(`Missing env vars: ${missing.join(", ")}`);
-  }
+  if (missing.length) throw new Error(`Missing env vars: ${missing.join(", ")}`);
 
   const payload = Buffer.from(JSON.stringify(obj)).toString("base64url");
   const sig = crypto
@@ -145,7 +94,47 @@ function verifyState(state) {
 }
 
 /**
- * HEALTH (must always work, even if other env vars are missing)
+ * GA4 auth helper: loads refresh_token, refreshes access token if needed,
+ * and optionally persists latest access token back to Supabase.
+ */
+async function getGa4AuthForWorkspace(workspace_id) {
+  const supabase = getSupabase();
+
+  const { data, error } = await supabase
+    .from("oauth_tokens")
+    .select("*")
+    .eq("client_id", workspace_id)
+    .eq("connector_type", "ga4")
+    .single();
+
+  if (error) throw error;
+  if (!data?.refresh_token) throw new Error("No GA4 refresh_token stored for this workspace");
+
+  const oauth2Client = getOAuthClient();
+  oauth2Client.setCredentials({
+    refresh_token: data.refresh_token,
+    access_token: data.access_token || undefined,
+    expiry_date: data.expiry_date || undefined,
+  });
+
+  // Force refresh if needed
+  await oauth2Client.getAccessToken();
+
+  // Persist refreshed access token (optional but good)
+  const c = oauth2Client.credentials;
+  if (c.access_token && c.expiry_date) {
+    await supabase
+      .from("oauth_tokens")
+      .update({ access_token: c.access_token, expiry_date: c.expiry_date })
+      .eq("client_id", workspace_id)
+      .eq("connector_type", "ga4");
+  }
+
+  return oauth2Client;
+}
+
+/**
+ * HEALTH (must always work)
  */
 app.get("/health", (req, res) => {
   res.json({
@@ -165,29 +154,20 @@ app.get("/health", (req, res) => {
 
 /**
  * 1) START OAUTH
- *
- * Use workspace_id as your internal tenant/client identifier (UUID)
- *
  * Call:
  *   /auth/ga4/start?workspace_id=<UUID>
- *
  * Backwards compatible: accepts client_id too.
  */
 app.get("/auth/ga4/start", async (req, res) => {
   try {
     const workspace_id =
-      (Array.isArray(req.query.workspace_id)
-        ? req.query.workspace_id[0]
-        : req.query.workspace_id) ||
-      (Array.isArray(req.query.client_id)
-        ? req.query.client_id[0]
-        : req.query.client_id);
+      (Array.isArray(req.query.workspace_id) ? req.query.workspace_id[0] : req.query.workspace_id) ||
+      (Array.isArray(req.query.client_id) ? req.query.client_id[0] : req.query.client_id);
 
     if (!workspace_id) {
       return res.status(400).json({
         error: "workspace_id required",
-        example:
-          "/auth/ga4/start?workspace_id=7a6e6ce9-f949-4824-9583-264593e98127",
+        example: "/auth/ga4/start?workspace_id=7a6e6ce9-f949-4824-9583-264593e98127",
       });
     }
 
@@ -229,7 +209,6 @@ app.get("/auth/ga4/start", async (req, res) => {
  * ✅ IMPORTANT FIX:
  * Google often returns refresh_token ONLY the first time.
  * So we only write refresh_token if Google actually sends one.
- * That prevents overwriting a good refresh_token with null.
  */
 app.get("/auth/ga4/callback", async (req, res) => {
   try {
@@ -241,18 +220,15 @@ app.get("/auth/ga4/callback", async (req, res) => {
     const decoded = verifyState(state);
     const { workspace_id } = decoded;
 
-    if (!isUuid(workspace_id)) {
-      return res.status(400).send("Invalid workspace_id in state");
-    }
+    if (!isUuid(workspace_id)) return res.status(400).send("Invalid workspace_id in state");
 
     const oauth2Client = getOAuthClient();
     const { tokens } = await oauth2Client.getToken(code);
 
     const supabase = getSupabase();
 
-    // Build payload WITHOUT refresh_token by default
     const payload = {
-      client_id: workspace_id, // keep column name if DB uses client_id (uuid)
+      client_id: workspace_id,
       connector_type: "ga4",
       access_token: tokens.access_token || null,
       expiry_date: tokens.expiry_date || null,
@@ -261,7 +237,6 @@ app.get("/auth/ga4/callback", async (req, res) => {
       updated_at: new Date().toISOString(),
     };
 
-    // ✅ Only set refresh_token if Google provides it
     if (tokens.refresh_token) {
       payload.refresh_token = tokens.refresh_token;
     }
@@ -272,14 +247,192 @@ app.get("/auth/ga4/callback", async (req, res) => {
 
     if (error) throw error;
 
-    // Redirect after success (configurable)
-    const redirectTo =
-      process.env.POST_OAUTH_REDIRECT_URL || "https://brifly.ai?ga4=connected";
-
+    const redirectTo = process.env.POST_OAUTH_REDIRECT_URL || "https://brifly.ai?ga4=connected";
     return res.redirect(redirectTo);
   } catch (e) {
     console.error("❌ /auth/ga4/callback error:", e);
     return res.status(500).send("OAuth failed");
+  }
+});
+
+/**
+ * GA4: Raw admin response (debug / internal)
+ * GET /ga4/accounts?workspace_id=<uuid>
+ */
+app.get("/ga4/accounts", async (req, res) => {
+  try {
+    const workspace_id = Array.isArray(req.query.workspace_id)
+      ? req.query.workspace_id[0]
+      : req.query.workspace_id;
+
+    if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
+
+    const auth = await getGa4AuthForWorkspace(workspace_id);
+    const admin = google.analyticsadmin({ version: "v1beta", auth });
+
+    const resp = await admin.accountSummaries.list();
+    return res.json(resp.data);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to list accounts", details: String(e?.message || e) });
+  }
+});
+
+/**
+ * Step 2: UI-friendly properties list (flattened)
+ * GET /ga4/properties?workspace_id=<uuid>
+ */
+app.get("/ga4/properties", async (req, res) => {
+  try {
+    const workspace_id = Array.isArray(req.query.workspace_id)
+      ? req.query.workspace_id[0]
+      : req.query.workspace_id;
+
+    if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
+
+    const auth = await getGa4AuthForWorkspace(workspace_id);
+    const admin = google.analyticsadmin({ version: "v1beta", auth });
+
+    const resp = await admin.accountSummaries.list();
+    const summaries = resp.data.accountSummaries || [];
+
+    const properties = summaries.flatMap((acc) =>
+      (acc.propertySummaries || []).map((p) => ({
+        account_id: acc.account,
+        account_name: acc.displayName,
+        property_id: p.property,
+        property_name: p.displayName,
+        property_type: p.propertyType,
+      }))
+    );
+
+    return res.json({ properties });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to list properties", details: String(e?.message || e) });
+  }
+});
+
+/**
+ * Step 3: Bind a selected GA4 property to this workspace
+ * POST /ga4/bind
+ * body: { workspace_id: "<uuid>", property_id: "properties/523107704" }
+ */
+app.post("/ga4/bind", async (req, res) => {
+  try {
+    const { workspace_id, property_id } = req.body || {};
+
+    if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
+    if (!isUuid(workspace_id)) return res.status(400).json({ error: "workspace_id must be a UUID" });
+
+    if (!property_id)
+      return res.status(400).json({ error: "property_id required (example: properties/523107704)" });
+
+    // Validate: property must be accessible using this workspace OAuth connection
+    const auth = await getGa4AuthForWorkspace(workspace_id);
+    const admin = google.analyticsadmin({ version: "v1beta", auth });
+    const resp = await admin.accountSummaries.list();
+
+    const summaries = resp.data.accountSummaries || [];
+    let found = null;
+
+    for (const acc of summaries) {
+      for (const p of acc.propertySummaries || []) {
+        if (p.property === property_id) {
+          found = {
+            account_id: acc.account,
+            account_name: acc.displayName,
+            property_id: p.property,
+            property_name: p.displayName,
+          };
+          break;
+        }
+      }
+      if (found) break;
+    }
+
+    if (!found) {
+      return res.status(400).json({
+        error: "property_id not accessible for this OAuth connection",
+        hint: "Call GET /ga4/properties and choose a property_id from that list",
+      });
+    }
+
+    const supabase = getSupabase();
+
+    const row = {
+      workspace_id,
+      connector_type: "ga4",
+      external_id: found.property_id, // GA4 property
+      account_id: found.account_id,   // GA4 account
+      display_name: found.property_name,
+      account_name: found.account_name,
+      status: "connected",
+      updated_at: new Date().toISOString(),
+    };
+
+    const { error } = await supabase
+      .from("workspace_connectors")
+      .upsert(row, { onConflict: "workspace_id,connector_type" });
+
+    if (error) throw error;
+
+    return res.json({ ok: true, bound: row });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to bind property", details: String(e?.message || e) });
+  }
+});
+
+/**
+ * Step 4: Status endpoint (for UI)
+ * GET /ga4/status?workspace_id=<uuid>
+ */
+app.get("/ga4/status", async (req, res) => {
+  try {
+    const workspace_id = Array.isArray(req.query.workspace_id)
+      ? req.query.workspace_id[0]
+      : req.query.workspace_id;
+
+    if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
+
+    const supabase = getSupabase();
+
+    const [{ data: binding, error: bindErr }, { data: tokenRow, error: tokErr }] = await Promise.all([
+      supabase
+        .from("workspace_connectors")
+        .select("*")
+        .eq("workspace_id", workspace_id)
+        .eq("connector_type", "ga4")
+        .maybeSingle(),
+      supabase
+        .from("oauth_tokens")
+        .select("client_id, connector_type, refresh_token, scope, expiry_date, updated_at")
+        .eq("client_id", workspace_id)
+        .eq("connector_type", "ga4")
+        .maybeSingle(),
+    ]);
+
+    if (bindErr) throw bindErr;
+    if (tokErr) throw tokErr;
+
+    const hasToken = !!tokenRow?.refresh_token;
+
+    return res.json({
+      connected: !!binding && hasToken,
+      has_token: hasToken,
+      binding: binding || null,
+      token_meta: tokenRow
+        ? {
+            scope: tokenRow.scope || null,
+            expiry_date: tokenRow.expiry_date || null,
+            updated_at: tokenRow.updated_at || null,
+          }
+        : null,
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to fetch status", details: String(e?.message || e) });
   }
 });
 
