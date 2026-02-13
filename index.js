@@ -885,6 +885,7 @@ app.post("/ga4/store", async (req, res) => {
       .from("connector_snapshots")
       .upsert(
         {
+          workspace_id: workspace_id || req.body?.workspace_id,
           workspace_id,
           connector_type: "ga4",
           external_id: binding.external_id,
@@ -897,6 +898,7 @@ app.post("/ga4/store", async (req, res) => {
           limit_value: Number(limit),
           offset_value: Number(offset),
           dedupe_key,
+          payload_json: envelope,
           data_json: envelope,
           status: "success",
           updated_at: new Date().toISOString(),
@@ -1004,6 +1006,7 @@ app.post("/ga4/store-presets", async (req, res) => {
           .from("connector_snapshots")
           .upsert(
             {
+              workspace_id: workspace_id || req.body?.workspace_id,
               workspace_id,
               connector_type: "ga4",
               external_id: binding.external_id,
@@ -1016,6 +1019,7 @@ app.post("/ga4/store-presets", async (req, res) => {
               limit_value: Number(limit),
               offset_value: Number(offset),
               dedupe_key,
+              payload_json: envelope,
               data_json: envelope,
               status: "success",
               updated_at: new Date().toISOString(),
@@ -1240,8 +1244,11 @@ app.post("/ga4/custom-report", async (req, res) => {
  * POST /ga4/custom-store
  */
 app.post("/ga4/custom-store", async (req, res) => {
+  let workspace_id = null;
+  let external_id = null;
   try {
     const {
+      workspace_id: ws,
       workspace_id,
       date_from = "30daysAgo",
       date_to = "today",
@@ -1250,12 +1257,14 @@ app.post("/ga4/custom-store", async (req, res) => {
       limit = 50,
       offset = 0,
     } = req.body || {};
+    workspace_id = ws;
 
     if (!workspace_id) {
       return res.status(400).json({ error: "workspace_id required" });
     }
 
     const binding = await getBoundGa4Property(workspace_id);
+    external_id = binding.external_id;
     const meta = await getGa4FieldsForWorkspace(workspace_id);
 
     const validationErrors = validateCustomFields(
@@ -1333,9 +1342,22 @@ app.post("/ga4/custom-store", async (req, res) => {
       .from("connector_snapshots")
       .upsert(
         {
+          workspace_id: workspace_id || req.body?.workspace_id,
           connector_type: "ga4",
+          external_id: binding.external_id,
+          report_type: "custom",
+          preset_name: null,
+          date_from,
+          date_to,
+          dimensions,
+          metrics,
+          limit_value: safeLimit,
+          offset_value: safeOffset,
           dedupe_key,
           payload_json: envelope,
+          data_json: envelope,
+          status: "success",
+          updated_at: new Date().toISOString(),
         },
         { onConflict: "dedupe_key" }
       )
@@ -1343,6 +1365,15 @@ app.post("/ga4/custom-store", async (req, res) => {
       .single();
 
     if (error) throw error;
+
+    await logAudit({
+      workspace_id,
+      action: "custom_store",
+      external_id,
+      request_json: req.body,
+      row_count: envelope.quality.row_count,
+      status: "success",
+    });
 
     return res.json({
       ok: true,
@@ -1353,6 +1384,16 @@ app.post("/ga4/custom-store", async (req, res) => {
     });
 
   } catch (e) {
+    await logAudit({
+      workspace_id,
+      action: "custom_store",
+      external_id,
+      request_json: req.body,
+      status: "failed",
+      error_message: String(e?.message || e),
+    });
+    console.error(e);
+    return res.status(500).json({ error: "Failed to store custom GA4 report", details: String(e?.message || e) });
     console.error("❌ custom-store error:", e);
     return res.status(500).json({
       error: "Failed to store custom GA4 report",
