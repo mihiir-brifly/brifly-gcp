@@ -21,6 +21,15 @@ function requireEnv(names) {
 }
 
 /**
+ * UUID sanity check (because your Supabase oauth_tokens.client_id is uuid)
+ */
+function isUuid(v) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(v || "")
+  );
+}
+
+/**
  * Lazy-init Supabase so the process can still boot and expose /health
  * even if env is misconfigured (prevents Cloud Run "didn't listen" confusion).
  */
@@ -94,18 +103,20 @@ app.get("/health", (req, res) => {
       GA4_OAUTH_CLIENT_SECRET: envExists("GA4_OAUTH_CLIENT_SECRET"),
       GA4_OAUTH_REDIRECT_URI: envExists("GA4_OAUTH_REDIRECT_URI"),
       STATE_SIGNING_SECRET: envExists("STATE_SIGNING_SECRET"),
+      POST_OAUTH_REDIRECT_URL: envExists("POST_OAUTH_REDIRECT_URL"),
     },
   });
 });
 
 /**
  * 1) START OAUTH
- * Use workspace_id as your internal tenant/client identifier
+ *
+ * Use workspace_id as your internal tenant/client identifier (UUID)
  *
  * Call:
- *   /auth/ga4/start?workspace_id=abc123
+ *   /auth/ga4/start?workspace_id=<UUID>
  *
- * (Backwards compatible: accepts client_id too)
+ * Backwards compatible: accepts client_id too.
  */
 app.get("/auth/ga4/start", async (req, res) => {
   try {
@@ -120,7 +131,15 @@ app.get("/auth/ga4/start", async (req, res) => {
     if (!workspace_id) {
       return res.status(400).json({
         error: "workspace_id required",
-        example: "/auth/ga4/start?workspace_id=test_workspace",
+        example:
+          "/auth/ga4/start?workspace_id=7a6e6ce9-f949-4824-9583-264593e98127",
+      });
+    }
+
+    if (!isUuid(workspace_id)) {
+      return res.status(400).json({
+        error: "workspace_id must be a UUID (matches workspaces.id in Supabase)",
+        got: String(workspace_id),
       });
     }
 
@@ -151,6 +170,11 @@ app.get("/auth/ga4/start", async (req, res) => {
 /**
  * 2) OAUTH CALLBACK
  * Google redirects here with ?code=...&state=...
+ *
+ * ✅ IMPORTANT FIX:
+ * Google often returns refresh_token ONLY the first time.
+ * So we only write refresh_token if Google actually sends one.
+ * That prevents overwriting a good refresh_token with null.
  */
 app.get("/auth/ga4/callback", async (req, res) => {
   try {
@@ -162,21 +186,30 @@ app.get("/auth/ga4/callback", async (req, res) => {
     const decoded = verifyState(state);
     const { workspace_id } = decoded;
 
+    if (!isUuid(workspace_id)) {
+      return res.status(400).send("Invalid workspace_id in state");
+    }
+
     const oauth2Client = getOAuthClient();
     const { tokens } = await oauth2Client.getToken(code);
 
+    const supabase = getSupabase();
+
+    // Build payload WITHOUT refresh_token by default
     const payload = {
-      client_id: workspace_id, // keep column name if your DB uses client_id
+      client_id: workspace_id, // keep column name if DB uses client_id (uuid)
       connector_type: "ga4",
       access_token: tokens.access_token || null,
-      refresh_token: tokens.refresh_token || null,
       expiry_date: tokens.expiry_date || null,
       token_type: tokens.token_type || null,
       scope: tokens.scope || null,
       updated_at: new Date().toISOString(),
     };
 
-    const supabase = getSupabase();
+    // ✅ Only set refresh_token if Google provides it
+    if (tokens.refresh_token) {
+      payload.refresh_token = tokens.refresh_token;
+    }
 
     const { error } = await supabase
       .from("oauth_tokens")
@@ -184,8 +217,11 @@ app.get("/auth/ga4/callback", async (req, res) => {
 
     if (error) throw error;
 
-    // For now just redirect to homepage
-    return res.redirect(`https://brifly.ai?ga4=connected`);
+    // Redirect after success (configurable)
+    const redirectTo =
+      process.env.POST_OAUTH_REDIRECT_URL || "https://brifly.ai?ga4=connected";
+
+    return res.redirect(redirectTo);
   } catch (e) {
     console.error("❌ /auth/ga4/callback error:", e);
     return res.status(500).send("OAuth failed");
@@ -199,7 +235,7 @@ app.get("/auth/ga4/callback", async (req, res) => {
  */
 const PORT = Number(process.env.PORT) || 8080;
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`✅ Server listening on ${PORT}`);
+  console.log(`✅ brifly-api listening on ${PORT}`);
 });
 
 // Helps catch “silent crashes”
