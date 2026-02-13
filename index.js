@@ -509,6 +509,35 @@ function buildGa4Request(preset, date_from, date_to, limit = 50, offset = 0) {
         orderBys: [{ metric: { metricName: "activeUsers" }, desc: true }],
       };
 
+    // ✅ NEW: Top events
+    case "events":
+      return {
+        ...base,
+        dimensions: [{ name: "eventName" }],
+        metrics: [{ name: "eventCount" }, { name: "activeUsers" }],
+        orderBys: [{ metric: { metricName: "eventCount" }, desc: true }],
+      };
+
+    // ✅ NEW: Landing pages (best for SEO reporting)
+    case "landing_pages":
+      return {
+        ...base,
+        dimensions: [{ name: "landingPagePlusQueryString" }],
+        metrics: [{ name: "sessions" }, { name: "activeUsers" }, { name: "screenPageViews" }],
+        orderBys: [{ metric: { metricName: "sessions" }, desc: true }],
+      };
+
+    // ✅ NEW: Conversions / Key events
+    // GA4 now calls them "key events" in many places.
+    // If this errors for your property, call /ga4/metadata and swap metric name accordingly.
+    case "conversions":
+      return {
+        ...base,
+        dimensions: [{ name: "eventName" }],
+        metrics: [{ name: "keyEvents" }, { name: "eventCount" }],
+        orderBys: [{ metric: { metricName: "keyEvents" }, desc: true }],
+      };
+
     default:
       throw new Error(`Unknown preset: ${preset}`);
   }
@@ -628,7 +657,105 @@ app.get("/ga4/report", async (req, res) => {
     return res.status(500).json({ error: "Failed to run GA4 report", details: String(e?.message || e) });
   }
 });
+app.post("/ga4/store-presets", async (req, res) => {
+  try {
+    const {
+      workspace_id,
+      date_from = "30daysAgo",
+      date_to = "today",
+      presets = ["overview", "top_pages", "acquisition", "geo", "devices", "events", "landing_pages", "conversions"],
+      limit = 50,
+      offset = 0,
+      job_id = null,
+    } = req.body || {};
 
+    if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
+
+    const binding = await getBoundGa4Property(workspace_id);
+    const auth = await getGa4AuthForWorkspace(workspace_id);
+    const dataApi = google.analyticsdata({ version: "v1beta", auth });
+    const supabase = getSupabase();
+
+    const results = [];
+
+    for (const preset of presets) {
+      try {
+        const requestBody = buildGa4Request(preset, date_from, date_to, limit, offset);
+
+        const resp = await dataApi.properties.runReport({
+          property: binding.external_id,
+          requestBody,
+        });
+
+        const normalized = normalizeReport(resp.data);
+
+        const envelope = {
+          schema_version: "1.0",
+          connector_type: "ga4",
+          workspace_id,
+          pulled_at: new Date().toISOString(),
+          request: {
+            preset,
+            date_from,
+            date_to,
+            property_id: binding.external_id,
+            limit,
+            offset,
+          },
+          data: normalized,
+          quality: {
+            row_count: normalized.rows.length,
+            warnings: [],
+          },
+          raw: resp.data,
+        };
+
+        const { data, error } = await supabase
+          .from("raw_connector_data")
+          .insert({
+            job_id: job_id,
+            connector_type: "ga4",
+            payload_json: envelope,
+          })
+          .select()
+          .single();
+
+        if (error) throw error;
+
+        results.push({
+          preset,
+          ok: true,
+          row_count: envelope.quality.row_count,
+          stored_id: data.id,
+          created_at: data.created_at,
+        });
+      } catch (innerErr) {
+        results.push({
+          preset,
+          ok: false,
+          error: String(innerErr?.message || innerErr),
+        });
+      }
+    }
+
+    const okCount = results.filter((r) => r.ok).length;
+    const failCount = results.length - okCount;
+
+    return res.json({
+      ok: failCount === 0,
+      workspace_id,
+      property_id: binding.external_id,
+      date_from,
+      date_to,
+      stored: okCount,
+      failed: failCount,
+      results,
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to store presets", details: String(e?.message || e) });
+  }
+});
 /**
  * Optional: Pull + store into raw_connector_data (future-proof storage)
  * POST /ga4/store
