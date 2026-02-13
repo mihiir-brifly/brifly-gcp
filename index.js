@@ -465,7 +465,7 @@ app.get("/ga4/latest", async (req, res) => {
     }
 
     const { data, error } = await supabase
-      .from("raw_connector_data")
+      .from("connector_snapshots")
       .select("*")
       .eq("workspace_id", workspace_id)
       .eq("dedupe_key", dedupe_key)
@@ -804,7 +804,7 @@ app.post("/ga4/store", async (req, res) => {
 
     const supabase = getSupabase();
     const { data, error } = await supabase
-      .from("raw_connector_data")
+      .from("connector_snapshots")
       .upsert(
         {
           job_id,
@@ -892,7 +892,7 @@ app.post("/ga4/store-presets", async (req, res) => {
         ]);
 
         const { data, error } = await supabase
-          .from("raw_connector_data")
+          .from("connector_snapshots")
           .upsert(
             {
               job_id,
@@ -1183,7 +1183,7 @@ app.post("/ga4/custom-store", async (req, res) => {
 
     const supabase = getSupabase();
     const { data, error } = await supabase
-      .from("raw_connector_data")
+      .from("connector_snapshots")
       .upsert(
         {
           job_id,
