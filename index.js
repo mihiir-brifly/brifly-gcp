@@ -406,7 +406,97 @@ app.get("/ga4/accounts", async (req, res) => {
     return res.status(500).json({ error: "Failed to list accounts", details: String(e?.message || e) });
   }
 });
+/**
+ * 9) GET LATEST SNAPSHOT (NO GOOGLE CALL)
+ *
+ * Example:
+ * /ga4/latest?workspace_id=UUID&preset=overview&date_from=30daysAgo&date_to=today
+ *
+ * OR for custom:
+ * /ga4/latest?workspace_id=UUID&date_from=30daysAgo&date_to=today&dimensions=country&metrics=activeUsers,sessions&limit=50
+ */
+app.get("/ga4/latest", async (req, res) => {
+  try {
+    const {
+      workspace_id,
+      preset,
+      date_from,
+      date_to,
+      dimensions,
+      metrics,
+      limit,
+      offset
+    } = req.query;
 
+    if (!workspace_id) {
+      return res.status(400).json({ error: "workspace_id required" });
+    }
+
+    const supabase = getSupabase();
+
+    // ---- Build dedupe key EXACTLY same way as store endpoints ----
+
+    let dedupe_key;
+
+    if (preset) {
+      dedupe_key = [
+        "ga4",
+        workspace_id,
+        "preset",
+        preset,
+        date_from,
+        date_to
+      ].join("|");
+    } else {
+      const dims = dimensions ? String(dimensions) : "";
+      const mets = metrics ? String(metrics) : "";
+
+      dedupe_key = [
+        "ga4",
+        workspace_id,
+        "custom",
+        date_from,
+        date_to,
+        dims,
+        mets,
+        limit || 100,
+        offset || 0
+      ].join("|");
+    }
+
+    const { data, error } = await supabase
+      .from("raw_connector_data")
+      .select("*")
+      .eq("workspace_id", workspace_id)
+      .eq("dedupe_key", dedupe_key)
+      .order("updated_at", { ascending: false })
+      .limit(1)
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({
+        error: "No snapshot found",
+        dedupe_key
+      });
+    }
+
+    return res.json({
+      ok: true,
+      dedupe_key,
+      pulled_at: data.pulled_at,
+      updated_at: data.updated_at,
+      row_count: data.row_count,
+      payload: data.payload_json
+    });
+
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({
+      error: "Failed to fetch latest snapshot",
+      details: String(e?.message || e)
+    });
+  }
+});
 /**
  * UI-friendly flattened properties list
  */
