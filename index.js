@@ -1245,6 +1245,7 @@ app.post("/ga4/custom-store", async (req, res) => {
   try {
     const {
       workspace_id: ws,
+      workspace_id,
       date_from = "30daysAgo",
       date_to = "today",
       dimensions = [],
