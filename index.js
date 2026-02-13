@@ -434,40 +434,50 @@ app.get("/ga4/latest", async (req, res) => {
 
     const supabase = getSupabase();
 
-    // ---- Build dedupe key EXACTLY same way as store endpoints ----
-
     let dedupe_key;
 
     if (preset) {
-      dedupe_key = [
+      const binding = await getBoundGa4Property(workspace_id);
+      dedupe_key = makeDedupeKey([
         "ga4",
         workspace_id,
-        "preset",
-        preset,
-        date_from,
-        date_to
-      ].join("|");
+        binding.external_id,
+        String(preset),
+        String(date_from || "30daysAgo"),
+        String(date_to || "today"),
+        Number(limit || 50),
+        Number(offset || 0),
+      ]);
     } else {
-      const dims = dimensions ? String(dimensions) : "";
-      const mets = metrics ? String(metrics) : "";
+      const binding = await getBoundGa4Property(workspace_id);
+      const dims = dimensions
+        ? Array.isArray(dimensions)
+          ? dimensions
+          : String(dimensions).split(",").filter(Boolean)
+        : [];
+      const mets = metrics
+        ? Array.isArray(metrics)
+          ? metrics
+          : String(metrics).split(",").filter(Boolean)
+        : [];
 
-      dedupe_key = [
+      dedupe_key = makeDedupeKey([
         "ga4",
         workspace_id,
+        binding.external_id,
         "custom",
-        date_from,
-        date_to,
-        dims,
-        mets,
-        limit || 100,
-        offset || 0
-      ].join("|");
+        String(date_from || "30daysAgo"),
+        String(date_to || "today"),
+        stableJoin(dims),
+        stableJoin(mets),
+        Number(limit || 50),
+        Number(offset || 0),
+      ]);
     }
 
     const { data, error } = await supabase
       .from("connector_snapshots")
       .select("*")
-      .eq("workspace_id", workspace_id)
       .eq("dedupe_key", dedupe_key)
       .order("updated_at", { ascending: false })
       .limit(1)
@@ -483,10 +493,10 @@ app.get("/ga4/latest", async (req, res) => {
     return res.json({
       ok: true,
       dedupe_key,
-      pulled_at: data.pulled_at,
+      pulled_at: data.data_json?.pulled_at || null,
       updated_at: data.updated_at,
-      row_count: data.row_count,
-      payload: data.payload_json
+      row_count: data.data_json?.quality?.row_count || 0,
+      payload: data.data_json
     });
 
   } catch (e) {
@@ -755,7 +765,6 @@ app.post("/ga4/store", async (req, res) => {
       date_to = "today",
       limit = 50,
       offset = 0,
-      job_id = null,
     } = req.body || {};
 
     if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
@@ -807,10 +816,21 @@ app.post("/ga4/store", async (req, res) => {
       .from("connector_snapshots")
       .upsert(
         {
-          job_id,
+          workspace_id,
           connector_type: "ga4",
+          external_id: binding.external_id,
+          report_type: "preset",
+          preset_name: preset,
+          date_from,
+          date_to,
+          dimensions: [],
+          metrics: [],
+          limit_value: Number(limit),
+          offset_value: Number(offset),
           dedupe_key,
-          payload_json: envelope,
+          data_json: envelope,
+          status: "success",
+          updated_at: new Date().toISOString(),
         },
         { onConflict: "dedupe_key" }
       )
@@ -839,7 +859,6 @@ app.post("/ga4/store-presets", async (req, res) => {
       presets = ["overview", "top_pages", "acquisition", "geo", "devices", "events", "landing_pages", "conversions"],
       limit = 50,
       offset = 0,
-      job_id = null,
     } = req.body || {};
 
     if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
@@ -895,10 +914,21 @@ app.post("/ga4/store-presets", async (req, res) => {
           .from("connector_snapshots")
           .upsert(
             {
-              job_id,
+              workspace_id,
               connector_type: "ga4",
+              external_id: binding.external_id,
+              report_type: "preset",
+              preset_name: preset,
+              date_from,
+              date_to,
+              dimensions: [],
+              metrics: [],
+              limit_value: Number(limit),
+              offset_value: Number(offset),
               dedupe_key,
-              payload_json: envelope,
+              data_json: envelope,
+              status: "success",
+              updated_at: new Date().toISOString(),
             },
             { onConflict: "dedupe_key" }
           )
@@ -1104,7 +1134,6 @@ app.post("/ga4/custom-store", async (req, res) => {
   try {
     const {
       workspace_id,
-      job_id = null,
       date_from = "30daysAgo",
       date_to = "today",
       dimensions = [],
@@ -1186,10 +1215,21 @@ app.post("/ga4/custom-store", async (req, res) => {
       .from("connector_snapshots")
       .upsert(
         {
-          job_id,
+          workspace_id,
           connector_type: "ga4",
+          external_id: binding.external_id,
+          report_type: "custom",
+          preset_name: null,
+          date_from,
+          date_to,
+          dimensions,
+          metrics,
+          limit_value: safeLimit,
+          offset_value: safeOffset,
           dedupe_key,
-          payload_json: envelope,
+          data_json: envelope,
+          status: "success",
+          updated_at: new Date().toISOString(),
         },
         { onConflict: "dedupe_key" }
       )
