@@ -55,6 +55,34 @@ function getSupabase() {
   return _supabase;
 }
 
+async function logAudit({
+  workspace_id,
+  action,
+  external_id = null,
+  request_json = null,
+  row_count = null,
+  status = "success",
+  error_message = null,
+}) {
+  try {
+    if (!workspace_id) return;
+    const supabase = getSupabase();
+    const { error } = await supabase.from("connector_audit_logs").insert({
+      workspace_id,
+      connector_type: "ga4",
+      action,
+      external_id,
+      request_json,
+      row_count,
+      status,
+      error_message,
+    });
+    if (error) console.error("Audit log insert failed:", error);
+  } catch (auditErr) {
+    console.error("Audit log error:", auditErr);
+  }
+}
+
 /**
  * Signed state to prevent tampering
  * state = "<payloadBase64url>.<hmacSigBase64url>"
@@ -342,6 +370,7 @@ app.get("/auth/ga4/start", async (req, res) => {
  * ✅ refresh_token overwrite protection
  */
 app.get("/auth/ga4/callback", async (req, res) => {
+  let workspace_id = null;
   try {
     const code = Array.isArray(req.query.code) ? req.query.code[0] : req.query.code;
     const state = Array.isArray(req.query.state) ? req.query.state[0] : req.query.state;
@@ -349,7 +378,7 @@ app.get("/auth/ga4/callback", async (req, res) => {
     if (!code || !state) return res.status(400).send("Missing code/state");
 
     const decoded = verifyState(state);
-    const { workspace_id } = decoded;
+    workspace_id = decoded.workspace_id;
 
     if (!isUuid(workspace_id)) return res.status(400).send("Invalid workspace_id in state");
 
@@ -377,9 +406,25 @@ app.get("/auth/ga4/callback", async (req, res) => {
 
     if (error) throw error;
 
+    await logAudit({
+      workspace_id,
+      action: "oauth_connected",
+      external_id: null,
+      request_json: req.query,
+      status: "success",
+    });
+
     const redirectTo = process.env.POST_OAUTH_REDIRECT_URL || "https://brifly.ai?ga4=connected";
     return res.redirect(redirectTo);
   } catch (e) {
+    await logAudit({
+      workspace_id,
+      action: "oauth_connected",
+      external_id: null,
+      request_json: req.query,
+      status: "failed",
+      error_message: String(e?.message || e),
+    });
     console.error("❌ /auth/ga4/callback error:", e);
     return res.status(500).send("OAuth failed");
   }
@@ -547,8 +592,11 @@ app.get("/ga4/properties", async (req, res) => {
  * body: { workspace_id, property_id }
  */
 app.post("/ga4/bind", async (req, res) => {
+  let workspace_id = null;
+  let external_id = null;
   try {
-    const { workspace_id, property_id } = req.body || {};
+    const { workspace_id: ws, property_id } = req.body || {};
+    workspace_id = ws;
 
     if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
     if (!isUuid(workspace_id)) return res.status(400).json({ error: "workspace_id must be a UUID" });
@@ -587,6 +635,7 @@ app.post("/ga4/bind", async (req, res) => {
     }
 
     const supabase = getSupabase();
+    external_id = found.property_id;
 
     const row = {
       workspace_id,
@@ -605,8 +654,24 @@ app.post("/ga4/bind", async (req, res) => {
 
     if (error) throw error;
 
+    await logAudit({
+      workspace_id,
+      action: "bind_property",
+      external_id,
+      request_json: req.body,
+      status: "success",
+    });
+
     return res.json({ ok: true, bound: row });
   } catch (e) {
+    await logAudit({
+      workspace_id,
+      action: "bind_property",
+      external_id,
+      request_json: req.body,
+      status: "failed",
+      error_message: String(e?.message || e),
+    });
     console.error(e);
     return res.status(500).json({ error: "Failed to bind property", details: String(e?.message || e) });
   }
@@ -757,19 +822,23 @@ app.get("/ga4/report", async (req, res) => {
  * POST /ga4/store
  */
 app.post("/ga4/store", async (req, res) => {
+  let workspace_id = null;
+  let external_id = null;
   try {
     const {
-      workspace_id,
+      workspace_id: ws,
       preset = "overview",
       date_from = "30daysAgo",
       date_to = "today",
       limit = 50,
       offset = 0,
     } = req.body || {};
+    workspace_id = ws;
 
     if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
 
     const binding = await getBoundGa4Property(workspace_id);
+    external_id = binding.external_id;
     const auth = await getGa4AuthForWorkspace(workspace_id);
     const dataApi = google.analyticsdata({ version: "v1beta", auth });
 
@@ -839,8 +908,25 @@ app.post("/ga4/store", async (req, res) => {
 
     if (error) throw error;
 
+    await logAudit({
+      workspace_id,
+      action: "preset_store",
+      external_id,
+      request_json: req.body,
+      row_count: envelope.quality.row_count,
+      status: "success",
+    });
+
     return res.json({ ok: true, stored: data });
   } catch (e) {
+    await logAudit({
+      workspace_id,
+      action: "preset_store",
+      external_id,
+      request_json: req.body,
+      status: "failed",
+      error_message: String(e?.message || e),
+    });
     console.error(e);
     return res.status(500).json({ error: "Failed to store GA4 data", details: String(e?.message || e) });
   }
@@ -851,19 +937,23 @@ app.post("/ga4/store", async (req, res) => {
  * POST /ga4/store-presets
  */
 app.post("/ga4/store-presets", async (req, res) => {
+  let workspace_id = null;
+  let external_id = null;
   try {
     const {
-      workspace_id,
+      workspace_id: ws,
       date_from = "30daysAgo",
       date_to = "today",
       presets = ["overview", "top_pages", "acquisition", "geo", "devices", "events", "landing_pages", "conversions"],
       limit = 50,
       offset = 0,
     } = req.body || {};
+    workspace_id = ws;
 
     if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
 
     const binding = await getBoundGa4Property(workspace_id);
+    external_id = binding.external_id;
     const auth = await getGa4AuthForWorkspace(workspace_id);
     const dataApi = google.analyticsdata({ version: "v1beta", auth });
     const supabase = getSupabase();
@@ -955,6 +1045,17 @@ app.post("/ga4/store-presets", async (req, res) => {
 
     const okCount = results.filter((r) => r.ok).length;
     const failCount = results.length - okCount;
+    const totalRowCount = results.filter((r) => r.ok).reduce((sum, r) => sum + Number(r.row_count || 0), 0);
+
+    await logAudit({
+      workspace_id,
+      action: "preset_store_bulk",
+      external_id,
+      request_json: req.body,
+      row_count: totalRowCount,
+      status: failCount === 0 ? "success" : "failed",
+      error_message: failCount > 0 ? `${failCount} preset(s) failed` : null,
+    });
 
     return res.json({
       ok: failCount === 0,
@@ -967,6 +1068,14 @@ app.post("/ga4/store-presets", async (req, res) => {
       results,
     });
   } catch (e) {
+    await logAudit({
+      workspace_id,
+      action: "preset_store_bulk",
+      external_id,
+      request_json: req.body,
+      status: "failed",
+      error_message: String(e?.message || e),
+    });
     console.error(e);
     return res.status(500).json({ error: "Failed to store presets", details: String(e?.message || e) });
   }
@@ -1131,8 +1240,11 @@ app.post("/ga4/custom-report", async (req, res) => {
  * POST /ga4/custom-store
  */
 app.post("/ga4/custom-store", async (req, res) => {
+  let workspace_id = null;
+  let external_id = null;
   try {
     const {
+      workspace_id: ws,
       workspace_id,
       date_from = "30daysAgo",
       date_to = "today",
@@ -1141,10 +1253,12 @@ app.post("/ga4/custom-store", async (req, res) => {
       limit = 50,
       offset = 0,
     } = req.body || {};
+    workspace_id = ws;
 
     if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
 
     const binding = await getBoundGa4Property(workspace_id);
+    external_id = binding.external_id;
     const meta = await getGa4FieldsForWorkspace(workspace_id);
 
     const errors = validateCustomFields({ dimensions, metrics }, meta);
@@ -1238,6 +1352,15 @@ app.post("/ga4/custom-store", async (req, res) => {
 
     if (error) throw error;
 
+    await logAudit({
+      workspace_id,
+      action: "custom_store",
+      external_id,
+      request_json: req.body,
+      row_count: envelope.quality.row_count,
+      status: "success",
+    });
+
     return res.json({
       ok: true,
       stored_id: data.id,
@@ -1246,6 +1369,14 @@ app.post("/ga4/custom-store", async (req, res) => {
       dedupe_key,
     });
   } catch (e) {
+    await logAudit({
+      workspace_id,
+      action: "custom_store",
+      external_id,
+      request_json: req.body,
+      status: "failed",
+      error_message: String(e?.message || e),
+    });
     console.error(e);
     return res.status(500).json({ error: "Failed to store custom GA4 report", details: String(e?.message || e) });
   }
