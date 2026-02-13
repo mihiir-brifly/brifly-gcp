@@ -886,6 +886,7 @@ app.post("/ga4/store", async (req, res) => {
       .upsert(
         {
           workspace_id: workspace_id || req.body?.workspace_id,
+          workspace_id,
           connector_type: "ga4",
           external_id: binding.external_id,
           report_type: "preset",
@@ -1006,6 +1007,7 @@ app.post("/ga4/store-presets", async (req, res) => {
           .upsert(
             {
               workspace_id: workspace_id || req.body?.workspace_id,
+              workspace_id,
               connector_type: "ga4",
               external_id: binding.external_id,
               report_type: "preset",
@@ -1247,6 +1249,7 @@ app.post("/ga4/custom-store", async (req, res) => {
   try {
     const {
       workspace_id: ws,
+      workspace_id,
       date_from = "30daysAgo",
       date_to = "today",
       dimensions = [],
@@ -1256,18 +1259,23 @@ app.post("/ga4/custom-store", async (req, res) => {
     } = req.body || {};
     workspace_id = ws;
 
-    if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
+    if (!workspace_id) {
+      return res.status(400).json({ error: "workspace_id required" });
+    }
 
     const binding = await getBoundGa4Property(workspace_id);
     external_id = binding.external_id;
     const meta = await getGa4FieldsForWorkspace(workspace_id);
 
-    const errors = validateCustomFields({ dimensions, metrics }, meta);
-    if (errors.length) {
+    const validationErrors = validateCustomFields(
+      { dimensions, metrics },
+      meta
+    );
+
+    if (validationErrors.length) {
       return res.status(400).json({
         error: "Invalid fields",
-        errors,
-        hint: "Use GET /ga4/fields to pick valid dimensions/metrics",
+        errors: validationErrors,
       });
     }
 
@@ -1308,14 +1316,17 @@ app.post("/ga4/custom-store", async (req, res) => {
         offset: safeOffset,
       },
       data: normalized,
-      quality: { row_count: normalized.rows.length, warnings: [] },
+      quality: {
+        row_count: normalized.rows.length,
+        warnings: [],
+      },
       raw: resp.data,
     };
 
     const dedupe_key = makeDedupeKey([
       "ga4",
       workspace_id,
-      envelope.request.property_id,
+      binding.external_id,
       "custom",
       date_from,
       date_to,
@@ -1326,6 +1337,7 @@ app.post("/ga4/custom-store", async (req, res) => {
     ]);
 
     const supabase = getSupabase();
+
     const { data, error } = await supabase
       .from("connector_snapshots")
       .upsert(
@@ -1367,9 +1379,10 @@ app.post("/ga4/custom-store", async (req, res) => {
       ok: true,
       stored_id: data.id,
       created_at: data.created_at,
-      row_count: envelope.quality.row_count,
+      row_count: normalized.rows.length,
       dedupe_key,
     });
+
   } catch (e) {
     await logAudit({
       workspace_id,
@@ -1381,6 +1394,11 @@ app.post("/ga4/custom-store", async (req, res) => {
     });
     console.error(e);
     return res.status(500).json({ error: "Failed to store custom GA4 report", details: String(e?.message || e) });
+    console.error("❌ custom-store error:", e);
+    return res.status(500).json({
+      error: "Failed to store custom GA4 report",
+      details: String(e?.message || e),
+    });
   }
 });
 
