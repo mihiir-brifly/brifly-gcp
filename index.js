@@ -756,6 +756,273 @@ app.post("/ga4/store-presets", async (req, res) => {
     return res.status(500).json({ error: "Failed to store presets", details: String(e?.message || e) });
   }
 });
+
+// ----------------------
+// Step 7: Safe custom report
+// ----------------------
+
+const _ga4MetaCache = new Map(); // key: property_id, value: { ts, dimsSet, metsSet }
+const META_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours cache
+
+async function getGa4FieldsForWorkspace(workspace_id) {
+  const binding = await getBoundGa4Property(workspace_id);
+  const propertyId = binding.external_id; // "properties/523..."
+
+  const cached = _ga4MetaCache.get(propertyId);
+  if (cached && Date.now() - cached.ts < META_TTL_MS) return cached;
+
+  const auth = await getGa4AuthForWorkspace(workspace_id);
+  const dataApi = google.analyticsdata({ version: "v1beta", auth });
+
+  const metaResp = await dataApi.properties.getMetadata({
+    name: `${propertyId}/metadata`,
+  });
+
+  const dims = (metaResp.data.dimensions || []).map((d) => d.apiName).filter(Boolean);
+  const mets = (metaResp.data.metrics || []).map((m) => m.apiName).filter(Boolean);
+
+  const obj = {
+    ts: Date.now(),
+    dimsSet: new Set(dims),
+    metsSet: new Set(mets),
+    dimensions: dims,
+    metrics: mets,
+    propertyId,
+  };
+
+  _ga4MetaCache.set(propertyId, obj);
+  return obj;
+}
+
+function validateCustomFields({ dimensions = [], metrics = [] }, meta) {
+  const errors = [];
+
+  // Hard limits to keep requests safe + fast
+  if (dimensions.length > 9) errors.push("Too many dimensions (max 9)");
+  if (metrics.length > 10) errors.push("Too many metrics (max 10)");
+  if (dimensions.length === 0 && metrics.length === 0) errors.push("At least one dimension or metric is required");
+
+  for (const d of dimensions) {
+    if (!meta.dimsSet.has(d)) errors.push(`Invalid dimension: ${d}`);
+  }
+  for (const m of metrics) {
+    if (!meta.metsSet.has(m)) errors.push(`Invalid metric: ${m}`);
+  }
+
+  return errors;
+}
+
+/**
+ * Step 7A: UI-friendly list of available fields
+ * GET /ga4/fields?workspace_id=<uuid>
+ */
+app.get("/ga4/fields", async (req, res) => {
+  try {
+    const workspace_id = Array.isArray(req.query.workspace_id)
+      ? req.query.workspace_id[0]
+      : req.query.workspace_id;
+
+    if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
+
+    const meta = await getGa4FieldsForWorkspace(workspace_id);
+
+    return res.json({
+      property_id: meta.propertyId,
+      dimensions: meta.dimensions,
+      metrics: meta.metrics,
+      cached: true,
+      cache_ttl_hours: 6,
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to fetch GA4 fields", details: String(e?.message || e) });
+  }
+});
+
+/**
+ * Step 7B: Safe custom report (no storage)
+ * POST /ga4/custom-report
+ * body: {
+ *   workspace_id,
+ *   date_from, date_to,
+ *   dimensions: [...],
+ *   metrics: [...],
+ *   limit, offset
+ * }
+ */
+app.post("/ga4/custom-report", async (req, res) => {
+  try {
+    const {
+      workspace_id,
+      date_from = "30daysAgo",
+      date_to = "today",
+      dimensions = [],
+      metrics = [],
+      limit = 50,
+      offset = 0,
+    } = req.body || {};
+
+    if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
+
+    const binding = await getBoundGa4Property(workspace_id);
+    const meta = await getGa4FieldsForWorkspace(workspace_id);
+
+    const errors = validateCustomFields({ dimensions, metrics }, meta);
+    if (errors.length) {
+      return res.status(400).json({
+        error: "Invalid fields",
+        errors,
+        hint: "Use GET /ga4/fields to pick valid dimensions/metrics for this property",
+      });
+    }
+
+    const auth = await getGa4AuthForWorkspace(workspace_id);
+    const dataApi = google.analyticsdata({ version: "v1beta", auth });
+
+    const safeLimit = Math.max(1, Math.min(500, Number(limit)));
+    const safeOffset = Math.max(0, Number(offset));
+
+    const requestBody = {
+      dateRanges: [{ startDate: date_from, endDate: date_to }],
+      dimensions: dimensions.map((d) => ({ name: d })),
+      metrics: metrics.map((m) => ({ name: m })),
+      limit: safeLimit,
+      offset: safeOffset,
+    };
+
+    const resp = await dataApi.properties.runReport({
+      property: binding.external_id,
+      requestBody,
+    });
+
+    const normalized = normalizeReport(resp.data);
+
+    const envelope = {
+      schema_version: "1.0",
+      connector_type: "ga4",
+      workspace_id,
+      pulled_at: new Date().toISOString(),
+      request: {
+        preset: "custom",
+        date_from,
+        date_to,
+        property_id: binding.external_id,
+        dimensions,
+        metrics,
+        limit: safeLimit,
+        offset: safeOffset,
+      },
+      data: normalized,
+      quality: {
+        row_count: normalized.rows.length,
+        warnings: [],
+      },
+      raw: resp.data,
+    };
+
+    return res.json(envelope);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to run custom GA4 report", details: String(e?.message || e) });
+  }
+});
+
+/**
+ * Step 7C: Custom report + store to Supabase (raw_connector_data)
+ * POST /ga4/custom-store
+ * body: same as /ga4/custom-report + optional job_id
+ */
+app.post("/ga4/custom-store", async (req, res) => {
+  try {
+    const {
+      workspace_id,
+      job_id = null,
+      date_from = "30daysAgo",
+      date_to = "today",
+      dimensions = [],
+      metrics = [],
+      limit = 50,
+      offset = 0,
+    } = req.body || {};
+
+    if (!workspace_id) return res.status(400).json({ error: "workspace_id required" });
+
+    // Run same logic by calling custom-report handler inline
+    const binding = await getBoundGa4Property(workspace_id);
+    const meta = await getGa4FieldsForWorkspace(workspace_id);
+
+    const errors = validateCustomFields({ dimensions, metrics }, meta);
+    if (errors.length) {
+      return res.status(400).json({
+        error: "Invalid fields",
+        errors,
+        hint: "Use GET /ga4/fields to pick valid dimensions/metrics for this property",
+      });
+    }
+
+    const auth = await getGa4AuthForWorkspace(workspace_id);
+    const dataApi = google.analyticsdata({ version: "v1beta", auth });
+
+    const safeLimit = Math.max(1, Math.min(500, Number(limit)));
+    const safeOffset = Math.max(0, Number(offset));
+
+    const requestBody = {
+      dateRanges: [{ startDate: date_from, endDate: date_to }],
+      dimensions: dimensions.map((d) => ({ name: d })),
+      metrics: metrics.map((m) => ({ name: m })),
+      limit: safeLimit,
+      offset: safeOffset,
+    };
+
+    const resp = await dataApi.properties.runReport({
+      property: binding.external_id,
+      requestBody,
+    });
+
+    const normalized = normalizeReport(resp.data);
+
+    const envelope = {
+      schema_version: "1.0",
+      connector_type: "ga4",
+      workspace_id,
+      pulled_at: new Date().toISOString(),
+      request: {
+        preset: "custom",
+        date_from,
+        date_to,
+        property_id: binding.external_id,
+        dimensions,
+        metrics,
+        limit: safeLimit,
+        offset: safeOffset,
+      },
+      data: normalized,
+      quality: {
+        row_count: normalized.rows.length,
+        warnings: [],
+      },
+      raw: resp.data,
+    };
+
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from("raw_connector_data")
+      .insert({
+        job_id,
+        connector_type: "ga4",
+        payload_json: envelope,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    return res.json({ ok: true, stored_id: data.id, created_at: data.created_at, row_count: envelope.quality.row_count });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to store custom GA4 report", details: String(e?.message || e) });
+  }
+});
 /**
  * Optional: Pull + store into raw_connector_data (future-proof storage)
  * POST /ga4/store
