@@ -1,3 +1,10 @@
+console.log("BOOT_MARKER_v3", {
+  node: process.version,
+  revision: process.env.K_REVISION,
+  commit: process.env.COMMIT_SHA,
+  ts: new Date().toISOString(),
+});
+
 if (process.env.NODE_ENV !== "production") {
   try {
     await import("dotenv/config");
