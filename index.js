@@ -1,4 +1,10 @@
-import "dotenv/config";
+if (process.env.NODE_ENV !== "production") {
+  try {
+    await import("dotenv/config");
+  } catch (e) {
+    // ignore if dotenv isn't installed
+  }
+}
 import express from "express";
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
